@@ -63,12 +63,15 @@ class OrthoPipeline:
     blending     : 'weighted' | 'nearest' | 'multiband'
     min_baseline_m : minimum XY baseline in metres for frame thinning
     agl_tolerance_m : keep frames within this AGL distance from median AGL
+    refine_overlap_shift : refine each ortho tile by image-overlap registration
+    max_shift_px : max allowed XY shift (pixels) for overlap refinement
     """
 
     def __init__(self, image_dir, output='orthomosaic.tif',
                  gsd=None, scale=0.5, ground_alt=None,
                  dist_coeffs=None, run_ba=False, blending='weighted',
-                 min_baseline_m=2.0, agl_tolerance_m=15.0):
+                 min_baseline_m=2.0, agl_tolerance_m=15.0,
+                 refine_overlap_shift=True, max_shift_px=40.0):
         self.image_dir   = Path(image_dir)
         self.output      = Path(output)
         self.gsd_target  = gsd
@@ -79,6 +82,8 @@ class OrthoPipeline:
         self.blending    = blending
         self.min_baseline_m = float(min_baseline_m)
         self.agl_tolerance_m = float(agl_tolerance_m)
+        self.refine_overlap_shift = bool(refine_overlap_shift)
+        self.max_shift_px = float(max_shift_px)
 
         self._meta:  List[DJIImageMeta] = []
         self._poses: List[Pose]         = []
@@ -260,7 +265,14 @@ class OrthoPipeline:
             print("Too few poses for BA — skipping")
             return self._poses
 
-        K = self._build_K(self._meta[0], scale=1.0)
+        poses_before = [Pose(R=p.R.copy(), t=p.t.copy()) for p in self._poses]
+
+        # BA runs on images resized by SSCALE from native resolution,
+        # so K must be built from native intrinsics (without self.scale).
+        m0 = self._meta[0]
+        K = np.array([[m0.fx_pixels, 0, m0.cx_pixels],
+                      [0, m0.fy_pixels, m0.cy_pixels],
+                      [0, 0, 1]], dtype=np.float64)
         SSCALE = 0.1  # very small for BA feature matching
         K_s    = K.copy(); K_s[:2] *= SSCALE
 
@@ -310,9 +322,27 @@ class OrthoPipeline:
             return self._poses
 
         rec_ref = BundleAdjuster(max_iterations=max_iter).optimize(rec)
+        poses_after = []
         for i in range(len(self._poses)):
             c = rec_ref.cameras[i]
-            self._poses[i] = Pose(R=c.R, t=c.t)
+            poses_after.append(Pose(R=c.R, t=c.t))
+
+        def _xy_span(poses):
+            centers = np.array([p.C[:2] for p in poses], dtype=np.float64)
+            span = centers.max(axis=0) - centers.min(axis=0)
+            return float(np.linalg.norm(span))
+
+        span_before = _xy_span(poses_before)
+        span_after  = _xy_span(poses_after)
+
+        # Reject unstable BA solutions that wildly expand/shrink scene geometry.
+        if (not np.isfinite(span_after)) or span_after <= 0 or span_before <= 0 or \
+           span_after > 5.0 * span_before or span_after < 0.2 * span_before:
+            print("BA sanity check failed — keeping original GPS/IMU poses")
+            self._poses = poses_before
+            return self._poses
+
+        self._poses = poses_after
         return self._poses
 
     # ── Step 4: orthorectify ──────────────────────────────────
@@ -368,6 +398,13 @@ class OrthoPipeline:
 
         accum = np.zeros((out_h, out_w, 3), dtype=np.float64)
         wsum  = np.zeros((out_h, out_w),    dtype=np.float64)
+        best_w = None
+        nearest = None
+        seam_score = None
+        if self.blending == 'nearest':
+            best_w = np.zeros((out_h, out_w), dtype=np.float64)
+            nearest = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            seam_score = np.full((out_h, out_w), -1e9, dtype=np.float32)
 
         print(f"\nProcessing images …")
         for i, (m, pose) in enumerate(zip(meta, poses)):
@@ -388,13 +425,76 @@ class OrthoPipeline:
             ortho, weight = ort.orthorectify_image(img, pose, cam)
             oh = min(ortho.shape[0], out_h)
             ow = min(ortho.shape[1], out_w)
-            accum[:oh,:ow] += ortho[:oh,:ow].astype(np.float64) * weight[:oh,:ow,np.newaxis]
-            wsum[:oh,:ow]  += weight[:oh,:ow]
+
+            if self.refine_overlap_shift and i > 0:
+                if self.blending == 'nearest':
+                    ref_img = nearest[:oh, :ow]
+                    ref_w = best_w[:oh, :ow]
+                else:
+                    ref_img = np.clip(
+                        accum[:oh, :ow] / np.maximum(wsum[:oh, :ow, np.newaxis], 1e-8),
+                        0, 255).astype(np.uint8)
+                    ref_w = wsum[:oh, :ow]
+                ortho_ref, weight_ref = self._refine_overlap_shift(
+                    ref_img=ref_img,
+                    ref_w=ref_w,
+                    new_img=ortho[:oh, :ow],
+                    new_w=weight[:oh, :ow],
+                )
+                ortho[:oh, :ow] = ortho_ref
+                weight[:oh, :ow] = weight_ref
+
+            if self.blending == 'nearest':
+                w = weight[:oh, :ow]
+                nearest_view = nearest[:oh, :ow]
+                best_w_view = best_w[:oh, :ow]
+                score_old = seam_score[:oh, :ow]
+
+                valid_new = w > 0.05
+                valid_old = best_w_view > 0.0
+
+                # Content-aware seam score:
+                #   higher center-weight is good,
+                #   high color disagreement with existing mosaic is penalized.
+                diff = np.mean(
+                    np.abs(ortho[:oh, :ow].astype(np.float32) - nearest_view.astype(np.float32)),
+                    axis=2
+                ) / 255.0
+                score_new = (w.astype(np.float32) - 0.55 * diff).astype(np.float32)
+
+                # For empty pixels, always allow fill from new tile.
+                mask = valid_new & (~valid_old)
+
+                # In overlap, switch source only when new score is clearly better.
+                overlap = valid_new & valid_old
+                mask_overlap = overlap & (score_new > (score_old + 0.015))
+
+                if np.any(mask_overlap):
+                    # Remove tiny islands to avoid checkerboard seam artifacts.
+                    m8 = (mask_overlap.astype(np.uint8) * 255)
+                    kernel = np.ones((3, 3), np.uint8)
+                    m8 = cv2.morphologyEx(m8, cv2.MORPH_OPEN, kernel)
+                    m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, kernel)
+                    mask_overlap = m8 > 0
+
+                mask = mask | mask_overlap
+
+                nearest_view = nearest[:oh, :ow]
+                ortho_view = ortho[:oh, :ow]
+                nearest_view[mask] = ortho_view[mask]
+                best_w_view[mask] = w[mask]
+                score_old[mask] = score_new[mask]
+            else:
+                accum[:oh,:ow] += ortho[:oh,:ow].astype(np.float64) * weight[:oh,:ow,np.newaxis]
+                wsum[:oh,:ow]  += weight[:oh,:ow]
             del img, ortho, weight; gc.collect()
 
         print(f"\nNormalising …")
-        result   = np.clip(accum / np.maximum(wsum[:,:,np.newaxis], 1e-8),
-                           0, 255).astype(np.uint8)
+        if self.blending == 'nearest':
+            result = nearest
+        else:
+            result = np.clip(accum / np.maximum(wsum[:,:,np.newaxis], 1e-8),
+                             0, 255).astype(np.uint8)
         coverage = 100 * np.sum(result.any(axis=2)) / (out_h * out_w)
         print(f"Coverage: {coverage:.1f}%")
         return result, bounds, gsd
@@ -460,3 +560,109 @@ class OrthoPipeline:
             fx = m.fx_pixels*s, fy = m.fy_pixels*s,
             cx = m.cx_pixels*s, cy = m.cy_pixels*s,
             k1=dist[0], k2=dist[1], p1=dist[2], p2=dist[3], k3=dist[4])
+
+    def _refine_overlap_shift(self,
+                              ref_img: np.ndarray,
+                              ref_w: np.ndarray,
+                              new_img: np.ndarray,
+                              new_w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        overlap = (ref_w > 1e-6) & (new_w > 0.2)
+        if int(np.count_nonzero(overlap)) < 6000:
+            return new_img, new_w
+
+        ys, xs = np.where(overlap)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        if (y1 - y0) < 64 or (x1 - x0) < 64:
+            return new_img, new_w
+
+        ref_u8 = cv2.cvtColor(ref_img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        new_u8 = cv2.cvtColor(new_img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        ref_gray = ref_u8.astype(np.float32)
+        new_gray = new_u8.astype(np.float32)
+        m = overlap[y0:y1, x0:x1]
+        if int(np.count_nonzero(m)) < 4000:
+            return new_img, new_w
+
+        # 1) Try robust affine refinement from feature correspondences
+        #    (captures residual yaw/scale drift better than pure translation).
+        orb = cv2.ORB_create(nfeatures=1200, scaleFactor=1.2, nlevels=8)
+        kp_ref, des_ref = orb.detectAndCompute(ref_u8, None)
+        kp_new, des_new = orb.detectAndCompute(new_u8, None)
+        if des_ref is not None and des_new is not None and len(kp_ref) >= 40 and len(kp_new) >= 40:
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+            knn = matcher.knnMatch(des_new, des_ref, k=2)
+            good = []
+            for pair in knn:
+                if len(pair) < 2:
+                    continue
+                a, b = pair
+                if a.distance < 0.78 * b.distance:
+                    good.append(a)
+
+            if len(good) >= 30:
+                src = np.float32([kp_new[g.queryIdx].pt for g in good]).reshape(-1, 1, 2)
+                dst = np.float32([kp_ref[g.trainIdx].pt for g in good]).reshape(-1, 1, 2)
+                M_loc, inlier_mask = cv2.estimateAffinePartial2D(
+                    src, dst,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=2.5,
+                    maxIters=3000,
+                    confidence=0.995,
+                    refineIters=20,
+                )
+                if M_loc is not None and inlier_mask is not None:
+                    inliers = int(inlier_mask.sum())
+                    a, b, tx = M_loc[0]
+                    c, d, ty = M_loc[1]
+                    scale = float(np.sqrt(max(a * a + c * c, 1e-12)))
+                    rot_deg = float(np.degrees(np.arctan2(c, a)))
+                    if (inliers >= 25 and
+                        0.97 <= scale <= 1.03 and
+                        abs(rot_deg) <= 6.0 and
+                        abs(tx) <= self.max_shift_px and
+                        abs(ty) <= self.max_shift_px):
+                        # Lift local-crop transform to full tile coordinates.
+                        T1 = np.array([[1., 0., -x0], [0., 1., -y0], [0., 0., 1.]], dtype=np.float32)
+                        A3 = np.array([[a, b, tx], [c, d, ty], [0., 0., 1.]], dtype=np.float32)
+                        T2 = np.array([[1., 0., x0], [0., 1., y0], [0., 0., 1.]], dtype=np.float32)
+                        M_full = (T2 @ A3 @ T1)[:2, :]
+                        shifted_img = cv2.warpAffine(
+                            new_img, M_full, (new_img.shape[1], new_img.shape[0]),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0,
+                        )
+                        shifted_w = cv2.warpAffine(
+                            new_w.astype(np.float32), M_full, (new_w.shape[1], new_w.shape[0]),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0,
+                        ).astype(np.float64)
+                        return shifted_img, shifted_w
+
+        # 2) Fallback: translation-only phase correlation.
+        ref_f = np.zeros_like(ref_gray, dtype=np.float32)
+        new_f = np.zeros_like(new_gray, dtype=np.float32)
+        ref_vals = ref_gray[m]
+        new_vals = new_gray[m]
+        ref_f[m] = ref_vals - float(ref_vals.mean())
+        new_f[m] = new_vals - float(new_vals.mean())
+
+        h, w = ref_f.shape
+        win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+        (dx, dy), response = cv2.phaseCorrelate(ref_f, new_f, win)
+        if response < 0.05:
+            return new_img, new_w
+        if abs(dx) > self.max_shift_px or abs(dy) > self.max_shift_px:
+            return new_img, new_w
+
+        M = np.array([[1.0, 0.0, dx],
+                      [0.0, 1.0, dy]], dtype=np.float32)
+        shifted_img = cv2.warpAffine(
+            new_img, M, (new_img.shape[1], new_img.shape[0]),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        shifted_w = cv2.warpAffine(
+            new_w.astype(np.float32), M, (new_w.shape[1], new_w.shape[0]),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float64)
+        return shifted_img, shifted_w
