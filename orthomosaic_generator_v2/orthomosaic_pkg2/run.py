@@ -44,6 +44,12 @@ RAM guide:
     p.add_argument('--blending',   choices=['weighted','nearest','multiband'],
                    default='weighted')
     p.add_argument('--bundle-adjust', action='store_true')
+    p.add_argument('--use-dem', action='store_true',
+                   help='Build and use internal DEM for terrain-aware orthorectification')
+    p.add_argument('--dem-resolution', type=float, default=None,
+                   help='DEM grid resolution in metres (default: auto from GSD)')
+    p.add_argument('--dem-strength', type=float, default=0.25,
+                   help='DEM influence 0..1 (default: 0.25, conservative)')
     args = p.parse_args()
 
     if not args.images.exists():
@@ -56,6 +62,11 @@ RAM guide:
     if args.gsd:
         print(f"GSD       : {args.gsd} m/px")
     print(f"Scale     : {args.scale}")
+    if args.use_dem:
+        print(f"Use DEM   : yes")
+        if args.dem_resolution:
+            print(f"DEM res   : {args.dem_resolution} m")
+        print(f"DEM str   : {args.dem_strength}")
 
     try:
         from orthomosaic import OrthoPipeline
@@ -71,6 +82,9 @@ RAM guide:
         ground_alt  = args.ground_alt,
         run_ba      = args.bundle_adjust,
         blending    = args.blending,
+        use_dem     = args.use_dem,
+        dem_resolution = args.dem_resolution,
+        dem_strength = args.dem_strength,
     )
     try:
         out = pipe.run()

@@ -21,12 +21,14 @@ import cv2
 import gc
 from pathlib import Path
 from typing import Optional, List, Tuple
+from scipy.ndimage import distance_transform_edt
 
 from .exif_reader    import read_dji_image, DJIImageMeta
 from .pose           import Pose
 from .camera         import BrownConradyCamera, PinholeCamera
 from .georeference   import UTMTransformer, GeoTIFFWriter, GeoBounds
 from .orthorectifier import Orthorectifier, OrthoParams
+from .dense_matcher  import DenseMatcher
 from .bundle_adjustment import (BundleAdjuster, Reconstruction,
                                  CameraPose, Point3D, Observation)
 
@@ -65,13 +67,17 @@ class OrthoPipeline:
     agl_tolerance_m : keep frames within this AGL distance from median AGL
     refine_overlap_shift : refine each ortho tile by image-overlap registration
     max_shift_px : max allowed XY shift (pixels) for overlap refinement
+    use_dem : build DEM internally and use terrain-aware orthorectification
+    dem_resolution : DEM raster resolution in metres (default: auto)
+    dem_strength : DEM influence 0..1 (default: 0.25 for conservative correction)
     """
 
     def __init__(self, image_dir, output='orthomosaic.tif',
                  gsd=None, scale=0.5, ground_alt=None,
                  dist_coeffs=None, run_ba=False, blending='weighted',
                  min_baseline_m=2.0, agl_tolerance_m=15.0,
-                 refine_overlap_shift=True, max_shift_px=40.0):
+                 refine_overlap_shift=True, max_shift_px=40.0,
+                 use_dem=False, dem_resolution=None, dem_strength=0.25):
         self.image_dir   = Path(image_dir)
         self.output      = Path(output)
         self.gsd_target  = gsd
@@ -84,6 +90,9 @@ class OrthoPipeline:
         self.agl_tolerance_m = float(agl_tolerance_m)
         self.refine_overlap_shift = bool(refine_overlap_shift)
         self.max_shift_px = float(max_shift_px)
+        self.use_dem = bool(use_dem)
+        self.dem_resolution = dem_resolution
+        self.dem_strength = float(np.clip(dem_strength, 0.0, 1.0))
 
         self._meta:  List[DJIImageMeta] = []
         self._poses: List[Pose]         = []
@@ -379,8 +388,15 @@ class OrthoPipeline:
         print(f"\nOutput size : {int(w_m/gsd)}x{int(h_m/gsd)} px  "
               f"(~{npx:.1f} MB accumulators)")
 
+        dem = None
+        dem_res = 1.0
+        if self.use_dem:
+            dem, dem_res = self._build_internal_dem(meta, poses, bounds, gsd)
+
         params = OrthoParams(gsd=gsd, output_bounds=bounds,
-                             target_srs=f"EPSG:{self._utm.epsg_code}")
+                             target_srs=f"EPSG:{self._utm.epsg_code}",
+                             elevation_model=dem,
+                             dem_resolution=dem_res)
         ort    = Orthorectifier(params)
         out_h  = ort.height; out_w = ort.width
 
@@ -560,6 +576,135 @@ class OrthoPipeline:
             fx = m.fx_pixels*s, fy = m.fy_pixels*s,
             cx = m.cx_pixels*s, cy = m.cy_pixels*s,
             k1=dist[0], k2=dist[1], p1=dist[2], p2=dist[3], k3=dist[4])
+
+    def _build_internal_dem(self,
+                            meta: List[DJIImageMeta],
+                            poses: List[Pose],
+                            bounds: Tuple[float, float, float, float],
+                            gsd: float) -> Tuple[Optional[np.ndarray], float]:
+        dem_res = float(self.dem_resolution) if self.dem_resolution else max(0.3, gsd * 3.0)
+        print(f"[DEM] Building internal DEM (res={dem_res:.2f} m) …")
+
+        matcher = DenseMatcher(window_size=9, max_disparity=96,
+                               min_depth=5.0, max_depth=500.0)
+
+        depth_maps = []
+        ref_poses = []
+        depth_scale = min(0.5, max(0.25, self.scale))
+
+        for i in range(len(meta) - 1):
+            m1, m2 = meta[i], meta[i + 1]
+            p1, p2 = poses[i], poses[i + 1]
+            try:
+                img1 = cv2.imread(str(m1.path))
+                img2 = cv2.imread(str(m2.path))
+                if img1 is None or img2 is None:
+                    continue
+
+                if depth_scale != 1.0:
+                    s1 = (max(64, int(m1.image_width * depth_scale)),
+                          max(64, int(m1.image_height * depth_scale)))
+                    s2 = (max(64, int(m2.image_width * depth_scale)),
+                          max(64, int(m2.image_height * depth_scale)))
+                    img1 = cv2.resize(img1, s1)
+                    img2 = cv2.resize(img2, s2)
+
+                K = np.array([[m1.fx_pixels * depth_scale, 0, m1.cx_pixels * depth_scale],
+                              [0, m1.fy_pixels * depth_scale, m1.cy_pixels * depth_scale],
+                              [0, 0, 1]], dtype=np.float64)
+
+                dist1 = np.array(self.dist_coeffs or
+                                 _DEFAULT_DIST.get(m1.model, _DEFAULT_DIST['UNKNOWN']),
+                                 dtype=np.float64)
+                dist2 = np.array(self.dist_coeffs or
+                                 _DEFAULT_DIST.get(m2.model, _DEFAULT_DIST['UNKNOWN']),
+                                 dtype=np.float64)
+
+                dm = matcher.compute_depth_stereo(img1, img2, p1, p2, K, dist1, dist2)
+                if int(np.count_nonzero(dm.mask)) < 2000:
+                    continue
+                depth_maps.append(dm)
+                ref_poses.append(p1)
+            except Exception:
+                continue
+            finally:
+                if 'img1' in locals():
+                    del img1
+                if 'img2' in locals():
+                    del img2
+                gc.collect()
+
+        if not depth_maps:
+            print("[DEM] No reliable stereo depth maps — skipping DEM")
+            return None, dem_res
+
+        K_ref = np.array([[meta[0].fx_pixels * depth_scale, 0, meta[0].cx_pixels * depth_scale],
+                          [0, meta[0].fy_pixels * depth_scale, meta[0].cy_pixels * depth_scale],
+                          [0, 0, 1]], dtype=np.float64)
+        points = matcher.fuse_depth_maps(depth_maps, ref_poses, K_ref)
+        if points.shape[0] < 5000:
+            print("[DEM] Too few 3D points — skipping DEM")
+            return None, dem_res
+
+        pts = points[np.isfinite(points).all(axis=1)]
+        if pts.shape[0] < 5000:
+            print("[DEM] Invalid 3D points after filtering — skipping DEM")
+            return None, dem_res
+
+        z = pts[:, 2]
+        z_lo, z_hi = np.percentile(z, [2, 98])
+        pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+        if pts.shape[0] < 5000:
+            print("[DEM] Too few inlier DEM points — skipping DEM")
+            return None, dem_res
+
+        x_min, y_min, x_max, y_max = bounds
+        w = max(1, int(np.ceil((x_max - x_min) / dem_res)))
+        h = max(1, int(np.ceil((y_max - y_min) / dem_res)))
+
+        xi = ((pts[:, 0] - x_min) / dem_res).astype(np.int32)
+        yi = ((pts[:, 1] - y_min) / dem_res).astype(np.int32)
+        valid = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        xi, yi, zv = xi[valid], yi[valid], pts[:, 2][valid]
+        if xi.size < 5000:
+            print("[DEM] DEM points outside bounds — skipping DEM")
+            return None, dem_res
+
+        z_sum = np.zeros((h, w), dtype=np.float64)
+        z_cnt = np.zeros((h, w), dtype=np.float64)
+        np.add.at(z_sum, (yi, xi), zv)
+        np.add.at(z_cnt, (yi, xi), 1.0)
+        dem = np.divide(z_sum, z_cnt, out=np.full((h, w), np.nan, dtype=np.float64), where=z_cnt > 0)
+
+        nan_mask = np.isnan(dem)
+        if np.all(nan_mask):
+            print("[DEM] DEM raster empty — skipping DEM")
+            return None, dem_res
+
+        if np.any(nan_mask):
+            idx = distance_transform_edt(nan_mask, return_distances=False, return_indices=True)
+            dem = dem[tuple(idx)]
+
+        dem = cv2.GaussianBlur(dem.astype(np.float32), (5, 5), 0).astype(np.float64)
+
+        # Normalize to local ground baseline (z≈0 in this pipeline world frame)
+        # and clamp to plausible terrain variation to avoid DEM over-warping.
+        z_med = float(np.median(dem))
+        dem = dem - z_med
+        dem = np.clip(dem, -12.0, 12.0)
+
+        # Strong smoothing to keep only low-frequency terrain shape.
+        dem = cv2.GaussianBlur(dem.astype(np.float32), (0, 0), 4.0).astype(np.float64)
+
+        span = float(np.percentile(dem, 98) - np.percentile(dem, 2))
+        if not np.isfinite(span) or span < 0.2:
+            print("[DEM] DEM not informative after normalization — skipping DEM")
+            return None, dem_res
+
+        dem *= self.dem_strength
+        print(f"[DEM] DEM ready: {w}x{h} cells, points={pts.shape[0]}, "
+              f"span={span:.2f}m, strength={self.dem_strength:.2f}")
+        return dem, dem_res
 
     def _refine_overlap_shift(self,
                               ref_img: np.ndarray,
