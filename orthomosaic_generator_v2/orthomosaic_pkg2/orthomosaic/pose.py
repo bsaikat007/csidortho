@@ -102,7 +102,8 @@ class Pose:
         """
         th     = np.radians(yaw_deg)
         cam_z  = np.array([0., 0., -1.])            # optical axis → down
-        cam_x  = np.array([np.sin(th), np.cos(th), 0.])  # right → yaw direction
+        # Camera right (X) is perpendicular to yaw: yaw=0°(N) → right=E, yaw=90°(E) → right=S
+        cam_x  = np.array([np.cos(th), -np.sin(th), 0.])
         cam_y  = np.cross(cam_z, cam_x)             # complete right-hand frame
 
         # R_world2cam rows = cam axes expressed in world

@@ -61,11 +61,14 @@ class OrthoPipeline:
     dist_coeffs  : [k1,k2,p1,p2,k3] override — None uses model defaults
     run_ba       : bundle adjustment (only for grid flights with lateral overlap)
     blending     : 'weighted' | 'nearest' | 'multiband'
+    min_baseline_m : minimum XY baseline in metres for frame thinning
+    agl_tolerance_m : keep frames within this AGL distance from median AGL
     """
 
     def __init__(self, image_dir, output='orthomosaic.tif',
                  gsd=None, scale=0.5, ground_alt=None,
-                 dist_coeffs=None, run_ba=False, blending='weighted'):
+                 dist_coeffs=None, run_ba=False, blending='weighted',
+                 min_baseline_m=2.0, agl_tolerance_m=15.0):
         self.image_dir   = Path(image_dir)
         self.output      = Path(output)
         self.gsd_target  = gsd
@@ -74,6 +77,8 @@ class OrthoPipeline:
         self.dist_coeffs = dist_coeffs
         self.run_ba      = run_ba
         self.blending    = blending
+        self.min_baseline_m = float(min_baseline_m)
+        self.agl_tolerance_m = float(agl_tolerance_m)
 
         self._meta:  List[DJIImageMeta] = []
         self._poses: List[Pose]         = []
@@ -126,8 +131,21 @@ class OrthoPipeline:
 
         # Build UTM transformer from all coordinates — BEFORE the pose loop
         self._utm = UTMTransformer.from_coordinates(lats, lons)
-        gc_deg    = self._utm.compute_grid_convergence(
-                        float(np.mean(lats)), float(np.mean(lons)))
+        coords_en = [self._utm.latlon_to_utm(m.latitude, m.longitude)
+                     for m in self._meta]
+
+        # Track-derived heading (0°=North, CW positive): much more stable for
+        # nadir images where gimbal yaw can jitter near pitch=-90°.
+        track_yaws = [None] * len(self._meta)
+        for i in range(len(coords_en)):
+            i0 = max(0, i - 1)
+            i1 = min(len(coords_en) - 1, i + 1)
+            de = coords_en[i1][0] - coords_en[i0][0]
+            dn = coords_en[i1][1] - coords_en[i0][1]
+            dxy = float(np.hypot(de, dn))
+            if dxy >= 0.5:
+                yaw_track = (np.degrees(np.arctan2(de, dn)) + 360.0) % 360.0
+                track_yaws[i] = float(yaw_track)
 
         # FIX [2]: ground altitude only needed as fallback
         if self.ground_alt is None:
@@ -139,8 +157,8 @@ class OrthoPipeline:
 
         poses = []
         skipped = 0
-        for m in self._meta:
-            e, n = self._utm.latlon_to_utm(m.latitude, m.longitude)
+        for i, m in enumerate(self._meta):
+            e, n = coords_en[i]
 
             # FIX [3]: prefer XMP RelativeAltitude (direct AGL measurement)
             if m.altitude_rel > 0:
@@ -153,7 +171,14 @@ class OrthoPipeline:
                     skipped += 1
                     continue
 
-            yaw_corrected = m.gimbal_yaw + gc_deg
+            # Prefer track heading for nadir, else use aircraft/camera yaw.
+            if abs(m.gimbal_pitch + 90) < 2.0 and track_yaws[i] is not None:
+                yaw_base = track_yaws[i]
+            else:
+                yaw_base = m.flight_yaw if abs(m.gimbal_pitch + 90) < 2.0 else m.gimbal_yaw
+
+            gc_deg = self._utm.compute_grid_convergence(m.latitude, m.longitude)
+            yaw_corrected = yaw_base + gc_deg
 
             if abs(m.gimbal_pitch + 90) < 2.0:
                 # Nadir (pitch ≈ -90°)
@@ -182,12 +207,49 @@ class OrthoPipeline:
         self._meta  = valid_meta
         self._poses = poses
 
-        print(f"Initialised {len(poses)} poses from GPS/IMU")
-        if len(poses) < 2:
+        # Frame thinning: remove near-static frames that mostly differ by yaw,
+        # which otherwise creates swirl artefacts in the blended mosaic.
+        if self.min_baseline_m > 0 and len(self._poses) > 1:
+            kept_meta = [self._meta[0]]
+            kept_poses = [self._poses[0]]
+            dropped = 0
+            for m, p in zip(self._meta[1:], self._poses[1:]):
+                dxy = float(np.linalg.norm(p.C[:2] - kept_poses[-1].C[:2]))
+                if dxy < self.min_baseline_m:
+                    dropped += 1
+                    continue
+                kept_meta.append(m)
+                kept_poses.append(p)
+
+            self._meta = kept_meta
+            self._poses = kept_poses
+            if dropped:
+                print(f"Frame thinning: dropped {dropped} near-static images "
+                      f"(< {self.min_baseline_m:.1f} m baseline)")
+
+        # Altitude consistency filtering: remove takeoff/ascent frames that
+        # are far from the mission's dominant flight altitude.
+        if self.agl_tolerance_m > 0 and len(self._meta) > 3:
+            agls = np.array([
+                m.altitude_rel if m.altitude_rel > 0 else m.altitude_abs - self.ground_alt
+                for m in self._meta
+            ], dtype=np.float64)
+            med_agl = float(np.median(agls))
+            keep_mask = np.abs(agls - med_agl) <= self.agl_tolerance_m
+            kept = int(np.sum(keep_mask))
+            if kept >= 2 and kept < len(self._meta):
+                dropped_alt = len(self._meta) - kept
+                self._meta = [m for m, k in zip(self._meta, keep_mask) if k]
+                self._poses = [p for p, k in zip(self._poses, keep_mask) if k]
+                print(f"Altitude filter: dropped {dropped_alt} frames outside "
+                      f"median±{self.agl_tolerance_m:.1f} m (median AGL={med_agl:.1f} m)")
+
+        print(f"Initialised {len(self._poses)} poses from GPS/IMU")
+        if len(self._poses) < 2:
             raise ValueError(
-                f"Only {len(poses)} valid poses. Check XMP RelativeAltitude tags "
+                f"Only {len(self._poses)} valid poses. Check XMP RelativeAltitude tags "
                 f"in your images — run: exiftool -RelativeAltitude DJI_0001.JPG")
-        return poses
+        return self._poses
 
     # ── Step 3 (optional): bundle adjustment ─────────────────
 
