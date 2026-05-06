@@ -8,6 +8,7 @@ from .bundle_adjustment import BundleAdjuster, Reconstruction, CameraPose, Point
 from .georeference import UTMTransformer, GeoTIFFWriter, GeoBounds, compute_optimal_utm_zone
 from .orthorectifier import Orthorectifier, OrthoParams
 from .dense_matcher import DenseMatcher, DepthMap
+from .dem_builder import DEMBuilder, DEMParams
 from .exif_reader import read_dji_image
 from .pipeline import OrthoPipeline
 
@@ -18,6 +19,7 @@ __all__ = [
     'UTMTransformer', 'GeoTIFFWriter', 'GeoBounds', 'compute_optimal_utm_zone',
     'Orthorectifier', 'OrthoParams',
     'DenseMatcher', 'DepthMap',
+    'DEMBuilder', 'DEMParams',
     'read_dji_image',
     'OrthoPipeline',
 ]

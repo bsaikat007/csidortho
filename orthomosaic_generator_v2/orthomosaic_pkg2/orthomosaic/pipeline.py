@@ -21,16 +21,15 @@ import cv2
 import gc
 from pathlib import Path
 from typing import Optional, List, Tuple
-from scipy.ndimage import distance_transform_edt
 
 from .exif_reader    import read_dji_image, DJIImageMeta
-from .pose           import Pose
+from .pose           import Pose, triangulate_points, solve_pnp
 from .camera         import BrownConradyCamera, PinholeCamera
 from .georeference   import UTMTransformer, GeoTIFFWriter, GeoBounds
 from .orthorectifier import Orthorectifier, OrthoParams
-from .dense_matcher  import DenseMatcher
 from .bundle_adjustment import (BundleAdjuster, Reconstruction,
                                  CameraPose, Point3D, Observation)
+from .dem_builder    import DEMBuilder, DEMParams
 
 
 # Typical distortion for common DJI cameras
@@ -63,13 +62,6 @@ class OrthoPipeline:
     dist_coeffs  : [k1,k2,p1,p2,k3] override — None uses model defaults
     run_ba       : bundle adjustment (only for grid flights with lateral overlap)
     blending     : 'weighted' | 'nearest' | 'multiband'
-    min_baseline_m : minimum XY baseline in metres for frame thinning
-    agl_tolerance_m : keep frames within this AGL distance from median AGL
-    refine_overlap_shift : refine each ortho tile by image-overlap registration
-    max_shift_px : max allowed XY shift (pixels) for overlap refinement
-    use_dem : build DEM internally and use terrain-aware orthorectification
-    dem_resolution : DEM raster resolution in metres (default: auto)
-    dem_strength : DEM influence 0..1 (default: 0.25 for conservative correction)
     """
 
     def __init__(self, image_dir, output='orthomosaic.tif',
@@ -77,7 +69,8 @@ class OrthoPipeline:
                  dist_coeffs=None, run_ba=False, blending='weighted',
                  min_baseline_m=2.0, agl_tolerance_m=15.0,
                  refine_overlap_shift=True, max_shift_px=40.0,
-                 use_dem=False, dem_resolution=None, dem_strength=0.25):
+                 use_dem=False, dem_mode='sparse', dem_gsd=None,
+                 dem_strength=0.25):
         self.image_dir   = Path(image_dir)
         self.output      = Path(output)
         self.gsd_target  = gsd
@@ -86,17 +79,19 @@ class OrthoPipeline:
         self.dist_coeffs = dist_coeffs
         self.run_ba      = run_ba
         self.blending    = blending
-        self.min_baseline_m = float(min_baseline_m)
-        self.agl_tolerance_m = float(agl_tolerance_m)
+        self.min_baseline_m      = float(min_baseline_m)
+        self.agl_tolerance_m    = float(agl_tolerance_m)
         self.refine_overlap_shift = bool(refine_overlap_shift)
-        self.max_shift_px = float(max_shift_px)
-        self.use_dem = bool(use_dem)
-        self.dem_resolution = dem_resolution
-        self.dem_strength = float(np.clip(dem_strength, 0.0, 1.0))
+        self.max_shift_px       = float(max_shift_px)
+        self.use_dem            = bool(use_dem)
+        self.dem_mode           = dem_mode
+        self.dem_gsd            = dem_gsd
+        self.dem_strength       = float(np.clip(dem_strength, 0.0, 1.0))
 
         self._meta:  List[DJIImageMeta] = []
         self._poses: List[Pose]         = []
         self._utm:   Optional[UTMTransformer] = None
+        self._all_meta_valid: List[DJIImageMeta] = []
 
     # ── Step 1: load ──────────────────────────────────────────
 
@@ -145,21 +140,8 @@ class OrthoPipeline:
 
         # Build UTM transformer from all coordinates — BEFORE the pose loop
         self._utm = UTMTransformer.from_coordinates(lats, lons)
-        coords_en = [self._utm.latlon_to_utm(m.latitude, m.longitude)
-                     for m in self._meta]
-
-        # Track-derived heading (0°=North, CW positive): much more stable for
-        # nadir images where gimbal yaw can jitter near pitch=-90°.
-        track_yaws = [None] * len(self._meta)
-        for i in range(len(coords_en)):
-            i0 = max(0, i - 1)
-            i1 = min(len(coords_en) - 1, i + 1)
-            de = coords_en[i1][0] - coords_en[i0][0]
-            dn = coords_en[i1][1] - coords_en[i0][1]
-            dxy = float(np.hypot(de, dn))
-            if dxy >= 0.5:
-                yaw_track = (np.degrees(np.arctan2(de, dn)) + 360.0) % 360.0
-                track_yaws[i] = float(yaw_track)
+        gc_deg    = self._utm.compute_grid_convergence(
+                        float(np.mean(lats)), float(np.mean(lons)))
 
         # FIX [2]: ground altitude only needed as fallback
         if self.ground_alt is None:
@@ -171,8 +153,8 @@ class OrthoPipeline:
 
         poses = []
         skipped = 0
-        for i, m in enumerate(self._meta):
-            e, n = coords_en[i]
+        for m in self._meta:
+            e, n = self._utm.latlon_to_utm(m.latitude, m.longitude)
 
             # FIX [3]: prefer XMP RelativeAltitude (direct AGL measurement)
             if m.altitude_rel > 0:
@@ -185,25 +167,13 @@ class OrthoPipeline:
                     skipped += 1
                     continue
 
-            # Prefer track heading for nadir, else use aircraft/camera yaw.
-            if abs(m.gimbal_pitch + 90) < 2.0 and track_yaws[i] is not None:
-                yaw_base = track_yaws[i]
-            else:
-                yaw_base = m.flight_yaw if abs(m.gimbal_pitch + 90) < 2.0 else m.gimbal_yaw
+            # Use FlightYaw when GimbalYaw is locked to body (0° on all images)
+            yaw_abs = m.gimbal_yaw if abs(m.gimbal_yaw) > 0.5 else m.flight_yaw
+            yaw_corrected = yaw_abs + gc_deg
 
-            gc_deg = self._utm.compute_grid_convergence(m.latitude, m.longitude)
-            yaw_corrected = yaw_base + gc_deg
-
-            if abs(m.gimbal_pitch + 90) < 2.0:
-                # Nadir (pitch ≈ -90°)
-                pose = Pose.make_nadir(e, n, agl, yaw_corrected)
-            else:
-                # Oblique
-                pose = Pose.from_euler_angles(
-                    np.radians(m.gimbal_roll),
-                    np.radians(m.gimbal_pitch),
-                    np.radians(yaw_corrected),
-                    np.array([e, n, agl]))
+            pose = Pose.from_dji_gimbal(
+                yaw_corrected, m.gimbal_pitch, m.gimbal_roll,
+                np.array([e, n, agl]))
 
             poses.append(pose)
 
@@ -221,8 +191,10 @@ class OrthoPipeline:
         self._meta  = valid_meta
         self._poses = poses
 
-        # Frame thinning: remove near-static frames that mostly differ by yaw,
-        # which otherwise creates swirl artefacts in the blended mosaic.
+        # Save all valid meta before thinning (for full-coverage gap fill)
+        self._all_meta_valid = list(valid_meta)
+
+        # Frame thinning: remove near-static frames
         if self.min_baseline_m > 0 and len(self._poses) > 1:
             kept_meta = [self._meta[0]]
             kept_poses = [self._poses[0]]
@@ -234,20 +206,17 @@ class OrthoPipeline:
                     continue
                 kept_meta.append(m)
                 kept_poses.append(p)
-
             self._meta = kept_meta
             self._poses = kept_poses
             if dropped:
                 print(f"Frame thinning: dropped {dropped} near-static images "
                       f"(< {self.min_baseline_m:.1f} m baseline)")
 
-        # Altitude consistency filtering: remove takeoff/ascent frames that
-        # are far from the mission's dominant flight altitude.
+        # Altitude consistency filtering
         if self.agl_tolerance_m > 0 and len(self._meta) > 3:
             agls = np.array([
                 m.altitude_rel if m.altitude_rel > 0 else m.altitude_abs - self.ground_alt
-                for m in self._meta
-            ], dtype=np.float64)
+                for m in self._meta], dtype=np.float64)
             med_agl = float(np.median(agls))
             keep_mask = np.abs(agls - med_agl) <= self.agl_tolerance_m
             kept = int(np.sum(keep_mask))
@@ -259,11 +228,11 @@ class OrthoPipeline:
                       f"median±{self.agl_tolerance_m:.1f} m (median AGL={med_agl:.1f} m)")
 
         print(f"Initialised {len(self._poses)} poses from GPS/IMU")
-        if len(self._poses) < 2:
+        if len(poses) < 2:
             raise ValueError(
-                f"Only {len(self._poses)} valid poses. Check XMP RelativeAltitude tags "
+                f"Only {len(poses)} valid poses. Check XMP RelativeAltitude tags "
                 f"in your images — run: exiftool -RelativeAltitude DJI_0001.JPG")
-        return self._poses
+        return poses
 
     # ── Step 3 (optional): bundle adjustment ─────────────────
 
@@ -274,14 +243,7 @@ class OrthoPipeline:
             print("Too few poses for BA — skipping")
             return self._poses
 
-        poses_before = [Pose(R=p.R.copy(), t=p.t.copy()) for p in self._poses]
-
-        # BA runs on images resized by SSCALE from native resolution,
-        # so K must be built from native intrinsics (without self.scale).
-        m0 = self._meta[0]
-        K = np.array([[m0.fx_pixels, 0, m0.cx_pixels],
-                      [0, m0.fy_pixels, m0.cy_pixels],
-                      [0, 0, 1]], dtype=np.float64)
+        K = self._build_K(self._meta[0], scale=1.0)
         SSCALE = 0.1  # very small for BA feature matching
         K_s    = K.copy(); K_s[:2] *= SSCALE
 
@@ -331,27 +293,9 @@ class OrthoPipeline:
             return self._poses
 
         rec_ref = BundleAdjuster(max_iterations=max_iter).optimize(rec)
-        poses_after = []
         for i in range(len(self._poses)):
             c = rec_ref.cameras[i]
-            poses_after.append(Pose(R=c.R, t=c.t))
-
-        def _xy_span(poses):
-            centers = np.array([p.C[:2] for p in poses], dtype=np.float64)
-            span = centers.max(axis=0) - centers.min(axis=0)
-            return float(np.linalg.norm(span))
-
-        span_before = _xy_span(poses_before)
-        span_after  = _xy_span(poses_after)
-
-        # Reject unstable BA solutions that wildly expand/shrink scene geometry.
-        if (not np.isfinite(span_after)) or span_after <= 0 or span_before <= 0 or \
-           span_after > 5.0 * span_before or span_after < 0.2 * span_before:
-            print("BA sanity check failed — keeping original GPS/IMU poses")
-            self._poses = poses_before
-            return self._poses
-
-        self._poses = poses_after
+            self._poses[i] = Pose(R=c.R, t=c.t)
         return self._poses
 
     # ── Step 4: orthorectify ──────────────────────────────────
@@ -362,6 +306,9 @@ class OrthoPipeline:
 
         meta  = self._meta
         poses = self._poses
+
+        # Full-coverage: also use non-thinned images for gap fill
+        fill_meta, fill_poses = self._get_fill_images()
 
         # Compute output bounds from image footprints
         e_vals, n_vals = [], []
@@ -388,10 +335,8 @@ class OrthoPipeline:
         print(f"\nOutput size : {int(w_m/gsd)}x{int(h_m/gsd)} px  "
               f"(~{npx:.1f} MB accumulators)")
 
-        dem = None
-        dem_res = 1.0
-        if self.use_dem:
-            dem, dem_res = self._build_internal_dem(meta, poses, bounds, gsd)
+        # Build DEM if requested
+        dem, dem_res = self._build_dem(meta, poses, bounds, gsd)
 
         params = OrthoParams(gsd=gsd, output_bounds=bounds,
                              target_srs=f"EPSG:{self._utm.epsg_code}",
@@ -400,27 +345,34 @@ class OrthoPipeline:
         ort    = Orthorectifier(params)
         out_h  = ort.height; out_w = ort.width
 
-        # Per-image brightness for radiometric normalisation
-        means = []
-        for m in meta:
-            img = cv2.imread(str(m.path))
-            if img is not None:
-                bright = img[img > 0].mean() if img.any() else 128.
-            else:
-                bright = 128.
-            means.append(float(bright))
-            del img; gc.collect()
-        global_mean = float(np.mean(means)) if means else 128.
+        # Overlap refinement
+        self._refine_overlap(meta, poses, ort)
 
-        accum = np.zeros((out_h, out_w, 3), dtype=np.float64)
-        wsum  = np.zeros((out_h, out_w),    dtype=np.float64)
-        best_w = None
-        nearest = None
-        seam_score = None
+        # Color harmonization: per-tile gain+offset to reference
+        ref_img = cv2.imread(str(meta[0].path))
+        if ref_img is not None and self.scale != 1.0:
+            ref_img = cv2.resize(ref_img,
+                (int(meta[0].image_width * self.scale),
+                 int(meta[0].image_height * self.scale)))
+        ref_mean = np.array([128., 128., 128.]) if ref_img is None \
+            else cv2.mean(ref_img)[:3]
+        ref_std  = np.array([40., 40., 40.]) if ref_img is None \
+            else np.array([float(np.std(ref_img[:,:,c])) for c in range(3)])
+        if ref_img is not None:
+            del ref_img; gc.collect()
+
+        use_multiband = (self.blending == 'multiband')
+
         if self.blending == 'nearest':
-            best_w = np.zeros((out_h, out_w), dtype=np.float64)
             nearest = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-            seam_score = np.full((out_h, out_w), -1e9, dtype=np.float32)
+            best_w  = np.zeros((out_h, out_w),    dtype=np.float64)
+            score_old = np.zeros((out_h, out_w),   dtype=np.float64)
+        elif use_multiband:
+            ortho_tiles = []
+            weight_tiles = []
+        else:
+            accum = np.zeros((out_h, out_w, 3), dtype=np.float64)
+            wsum  = np.zeros((out_h, out_w),    dtype=np.float64)
 
         print(f"\nProcessing images …")
         for i, (m, pose) in enumerate(zip(meta, poses)):
@@ -435,79 +387,92 @@ class OrthoPipeline:
                 img = cv2.resize(img, (nw, nh))
 
             cam  = self._build_camera(m)
-            gain = global_mean / max(means[i], 1e-6)
-            img  = np.clip(img.astype(np.float32)*gain, 0, 255).astype(np.uint8)
+
+            # Color harmonization
+            img_f = img.astype(np.float64)
+            for c in range(3):
+                tile_mean = float(img_f[:,:,c][img_f[:,:,c] > 0].mean()) \
+                    if np.any(img_f[:,:,c] > 0) else 128.
+                tile_std  = float(np.std(img_f[:,:,c][img_f[:,:,c] > 0])) \
+                    if np.any(img_f[:,:,c] > 0) else 40.
+                if tile_std < 1.0: tile_std = 40.0
+                img_f[:,:,c] = (img_f[:,:,c] - tile_mean) * (ref_std[c] / tile_std) + ref_mean[c]
+            img = np.clip(img_f, 0, 255).astype(np.uint8)
+            del img_f
 
             ortho, weight = ort.orthorectify_image(img, pose, cam)
             oh = min(ortho.shape[0], out_h)
             ow = min(ortho.shape[1], out_w)
 
-            if self.refine_overlap_shift and i > 0:
-                if self.blending == 'nearest':
-                    ref_img = nearest[:oh, :ow]
-                    ref_w = best_w[:oh, :ow]
-                else:
-                    ref_img = np.clip(
-                        accum[:oh, :ow] / np.maximum(wsum[:oh, :ow, np.newaxis], 1e-8),
-                        0, 255).astype(np.uint8)
-                    ref_w = wsum[:oh, :ow]
-                ortho_ref, weight_ref = self._refine_overlap_shift(
-                    ref_img=ref_img,
-                    ref_w=ref_w,
-                    new_img=ortho[:oh, :ow],
-                    new_w=weight[:oh, :ow],
-                )
-                ortho[:oh, :ow] = ortho_ref
-                weight[:oh, :ow] = weight_ref
-
             if self.blending == 'nearest':
-                w = weight[:oh, :ow]
-                nearest_view = nearest[:oh, :ow]
-                best_w_view = best_w[:oh, :ow]
-                score_old = seam_score[:oh, :ow]
-
-                valid_new = w > 0.05
-                valid_old = best_w_view > 0.0
-
-                # Content-aware seam score:
-                #   higher center-weight is good,
-                #   high color disagreement with existing mosaic is penalized.
-                diff = np.mean(
-                    np.abs(ortho[:oh, :ow].astype(np.float32) - nearest_view.astype(np.float32)),
-                    axis=2
-                ) / 255.0
-                score_new = (w.astype(np.float32) - 0.55 * diff).astype(np.float32)
-
-                # For empty pixels, always allow fill from new tile.
-                mask = valid_new & (~valid_old)
-
-                # In overlap, switch source only when new score is clearly better.
-                overlap = valid_new & valid_old
-                mask_overlap = overlap & (score_new > (score_old + 0.015))
-
-                if np.any(mask_overlap):
-                    # Remove tiny islands to avoid checkerboard seam artifacts.
-                    m8 = (mask_overlap.astype(np.uint8) * 255)
-                    kernel = np.ones((3, 3), np.uint8)
-                    m8 = cv2.morphologyEx(m8, cv2.MORPH_OPEN, kernel)
-                    m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, kernel)
-                    mask_overlap = m8 > 0
-
-                mask = mask | mask_overlap
-
-                nearest_view = nearest[:oh, :ow]
-                ortho_view = ortho[:oh, :ow]
-                nearest_view[mask] = ortho_view[mask]
-                best_w_view[mask] = w[mask]
-                score_old[mask] = score_new[mask]
+                score_new = weight[:oh,:ow]
+                mask = (score_new > score_old[:oh,:ow]) & (score_new > 0.01)
+                nearest[:oh,:ow][mask] = ortho[:oh,:ow][mask]
+                best_w[:oh,:ow][mask] = weight[:oh,:ow][mask]
+                score_old[:oh,:ow][mask] = score_new[mask]
+            elif use_multiband:
+                ortho_tiles.append(ortho[:oh, :ow].copy())
+                weight_tiles.append(weight[:oh, :ow].copy())
             else:
                 accum[:oh,:ow] += ortho[:oh,:ow].astype(np.float64) * weight[:oh,:ow,np.newaxis]
                 wsum[:oh,:ow]  += weight[:oh,:ow]
             del img, ortho, weight; gc.collect()
 
+        # Gap fill: process non-thinned images to fill coverage holes
+        if fill_meta and len(fill_meta) > len(meta):
+            main_paths = {m.path for m in meta}
+            fill_set = [(m, p) for m, p in zip(fill_meta, fill_poses)
+                        if m.path not in main_paths]
+            if fill_set:
+                print(f"\nGap-fill pass ({len(fill_set)} extra images) …")
+                for fi, (m, pose) in enumerate(fill_set):
+                    img = cv2.imread(str(m.path))
+                    if img is None:
+                        continue
+                    if self.scale != 1.0:
+                        nw = int(m.image_width * self.scale)
+                        nh = int(m.image_height * self.scale)
+                        img = cv2.resize(img, (nw, nh))
+
+                    cam = self._build_camera(m)
+                    # Color harmonization
+                    img_f = img.astype(np.float64)
+                    for c in range(3):
+                        tile_mean = float(img_f[:,:,c][img_f[:,:,c] > 0].mean()) \
+                            if np.any(img_f[:,:,c] > 0) else 128.
+                        tile_std = float(np.std(img_f[:,:,c][img_f[:,:,c] > 0])) \
+                            if np.any(img_f[:,:,c] > 0) else 40.
+                        if tile_std < 1.0: tile_std = 40.0
+                        img_f[:,:,c] = (img_f[:,:,c] - tile_mean) * (ref_std[c] / tile_std) + ref_mean[c]
+                    img = np.clip(img_f, 0, 255).astype(np.uint8)
+                    del img_f
+
+                    ortho, weight = ort.orthorectify_image(img, pose, cam)
+                    oh = min(ortho.shape[0], out_h)
+                    ow = min(ortho.shape[1], out_w)
+
+                    if self.blending == 'nearest':
+                        empty = (best_w[:oh, :ow] < 0.01) & (weight[:oh, :ow] > 0.05)
+                        if np.any(empty):
+                            nearest[:oh, :ow][empty] = ortho[:oh, :ow][empty]
+                            best_w[:oh, :ow][empty] = weight[:oh, :ow][empty]
+                    elif use_multiband:
+                        ortho_tiles.append(ortho[:oh, :ow].copy())
+                        weight_tiles.append(weight[:oh, :ow].copy())
+                    else:
+                        empty = (wsum[:oh, :ow] < 1e-6) & (weight[:oh, :ow] > 0.05)
+                        if np.any(empty):
+                            accum[:oh,:ow][empty] = (ortho[:oh,:ow].astype(np.float64)
+                                                      * weight[:oh,:ow,np.newaxis])[empty]
+                            wsum[:oh,:ow][empty] = weight[:oh,:ow][empty]
+                    del img, ortho, weight; gc.collect()
+
+        # Final blending
         print(f"\nNormalising …")
         if self.blending == 'nearest':
             result = nearest
+        elif use_multiband and ortho_tiles:
+            result = self._multiband_blend(ortho_tiles, weight_tiles, out_h, out_w)
         else:
             result = np.clip(accum / np.maximum(wsum[:,:,np.newaxis], 1e-8),
                              0, 255).astype(np.uint8)
@@ -547,21 +512,22 @@ class OrthoPipeline:
 
     def run(self) -> Path:
         print("="*55)
-        print("DRONE ORTHOMOSAIC - MEMORY EFFICIENT")
+        print("DRONE ORTHOMOSAIC - PROFESSIONAL")
         print("="*55)
         self.load_images()
         self.initialise_poses()
         if self.run_ba:
             print("\nRefining poses with bundle adjustment …")
             self.refine_poses()
+        self._refine_poses_pairwise()
         result, bounds, gsd = self.generate_orthomosaic()
         self.save(result, bounds, gsd)
         return self.output
 
     # ── Internal ──────────────────────────────────────────────
 
-    def _build_K(self, m: DJIImageMeta, scale=1.0) -> np.ndarray:
-        s = scale * self.scale
+    def _build_K(self, m: DJIImageMeta, scale=None) -> np.ndarray:
+        s = self.scale if scale is None else scale
         return np.array([[m.fx_pixels*s,0,m.cx_pixels*s],
                           [0,m.fy_pixels*s,m.cy_pixels*s],
                           [0,0,1]])
@@ -577,237 +543,342 @@ class OrthoPipeline:
             cx = m.cx_pixels*s, cy = m.cy_pixels*s,
             k1=dist[0], k2=dist[1], p1=dist[2], p2=dist[3], k3=dist[4])
 
-    def _build_internal_dem(self,
-                            meta: List[DJIImageMeta],
-                            poses: List[Pose],
-                            bounds: Tuple[float, float, float, float],
-                            gsd: float) -> Tuple[Optional[np.ndarray], float]:
-        dem_res = float(self.dem_resolution) if self.dem_resolution else max(0.3, gsd * 3.0)
-        print(f"[DEM] Building internal DEM (res={dem_res:.2f} m) …")
+    # ── Pairwise pose refinement ──────────────────────────────
 
-        matcher = DenseMatcher(window_size=9, max_disparity=96,
-                               min_depth=5.0, max_depth=500.0)
+    def _refine_poses_pairwise(self):
+        """SIFT+PnP pairwise pose refinement — corrects GPS drift.
 
-        depth_maps = []
-        ref_poses = []
-        depth_scale = min(0.5, max(0.25, self.scale))
+        For nadir flights PnP rotation is unreliable (degenerate),
+        so only the camera position is corrected.
+        """
+        if len(self._poses) < 3:
+            return
+        print("\nPairwise pose refinement (SIFT + PnP) …")
 
-        for i in range(len(meta) - 1):
-            m1, m2 = meta[i], meta[i + 1]
-            p1, p2 = poses[i], poses[i + 1]
-            try:
-                img1 = cv2.imread(str(m1.path))
-                img2 = cv2.imread(str(m2.path))
-                if img1 is None or img2 is None:
-                    continue
+        sift = cv2.SIFT_create(nfeatures=3000, contrastThreshold=0.02,
+                                edgeThreshold=12)
+        flann = cv2.FlannBasedMatcher({'algorithm': 1, 'trees': 5},
+                                       {'checks': 100})
 
-                if depth_scale != 1.0:
-                    s1 = (max(64, int(m1.image_width * depth_scale)),
-                          max(64, int(m1.image_height * depth_scale)))
-                    s2 = (max(64, int(m2.image_width * depth_scale)),
-                          max(64, int(m2.image_height * depth_scale)))
-                    img1 = cv2.resize(img1, s1)
-                    img2 = cv2.resize(img2, s2)
-
-                K = np.array([[m1.fx_pixels * depth_scale, 0, m1.cx_pixels * depth_scale],
-                              [0, m1.fy_pixels * depth_scale, m1.cy_pixels * depth_scale],
-                              [0, 0, 1]], dtype=np.float64)
-
-                dist1 = np.array(self.dist_coeffs or
-                                 _DEFAULT_DIST.get(m1.model, _DEFAULT_DIST['UNKNOWN']),
-                                 dtype=np.float64)
-                dist2 = np.array(self.dist_coeffs or
-                                 _DEFAULT_DIST.get(m2.model, _DEFAULT_DIST['UNKNOWN']),
-                                 dtype=np.float64)
-
-                dm = matcher.compute_depth_stereo(img1, img2, p1, p2, K, dist1, dist2)
-                if int(np.count_nonzero(dm.mask)) < 2000:
-                    continue
-                depth_maps.append(dm)
-                ref_poses.append(p1)
-            except Exception:
+        SCALE_FEAT = 0.25
+        feats = []
+        for m in self._meta:
+            img = cv2.imread(str(m.path))
+            if img is None:
+                feats.append(None)
                 continue
-            finally:
-                if 'img1' in locals():
-                    del img1
-                if 'img2' in locals():
-                    del img2
-                gc.collect()
+            nw = max(128, int(m.image_width  * SCALE_FEAT))
+            nh = max(128, int(m.image_height * SCALE_FEAT))
+            img_s = cv2.resize(img, (nw, nh))
+            gray = cv2.cvtColor(img_s, cv2.COLOR_BGR2GRAY)
+            kp, des = sift.detectAndCompute(gray, None)
+            feats.append((kp, des, (nw, nh)))
+            del img; gc.collect()
 
-        if not depth_maps:
-            print("[DEM] No reliable stereo depth maps — skipping DEM")
-            return None, dem_res
+        n_corrected = 0
+        for i in range(1, len(self._poses)):
+            best_pose = None
+            best_info = None
 
-        K_ref = np.array([[meta[0].fx_pixels * depth_scale, 0, meta[0].cx_pixels * depth_scale],
-                          [0, meta[0].fy_pixels * depth_scale, meta[0].cy_pixels * depth_scale],
-                          [0, 0, 1]], dtype=np.float64)
-        points = matcher.fuse_depth_maps(depth_maps, ref_poses, K_ref)
-        if points.shape[0] < 5000:
-            print("[DEM] Too few 3D points — skipping DEM")
-            return None, dem_res
+            for skip in [2, 1]:
+                j = i - skip
+                if j < 0:
+                    continue
+                if feats[j] is None or feats[i] is None:
+                    continue
 
-        pts = points[np.isfinite(points).all(axis=1)]
-        if pts.shape[0] < 5000:
-            print("[DEM] Invalid 3D points after filtering — skipping DEM")
-            return None, dem_res
+                kp_j, des_j, sz_j = feats[j]
+                kp_i, des_i, sz_i = feats[i]
+                if des_j is None or des_i is None:
+                    continue
+                if len(kp_j) < 30 or len(kp_i) < 30:
+                    continue
 
-        z = pts[:, 2]
-        z_lo, z_hi = np.percentile(z, [2, 98])
-        pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
-        if pts.shape[0] < 5000:
-            print("[DEM] Too few inlier DEM points — skipping DEM")
-            return None, dem_res
+                matches = flann.knnMatch(des_i, des_j, k=2)
+                good = []
+                for pair in matches:
+                    if len(pair) < 2:
+                        continue
+                    a, b = pair
+                    if a.distance < 0.75 * b.distance:
+                        good.append(a)
 
-        x_min, y_min, x_max, y_max = bounds
-        w = max(1, int(np.ceil((x_max - x_min) / dem_res)))
-        h = max(1, int(np.ceil((y_max - y_min) / dem_res)))
+                if len(good) < 25:
+                    continue
 
-        xi = ((pts[:, 0] - x_min) / dem_res).astype(np.int32)
-        yi = ((pts[:, 1] - y_min) / dem_res).astype(np.int32)
-        valid = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
-        xi, yi, zv = xi[valid], yi[valid], pts[:, 2][valid]
-        if xi.size < 5000:
-            print("[DEM] DEM points outside bounds — skipping DEM")
-            return None, dem_res
+                p_i = np.float32([kp_i[g.queryIdx].pt for g in good]).reshape(-1, 1, 2)
+                p_j = np.float32([kp_j[g.trainIdx].pt for g in good]).reshape(-1, 1, 2)
 
-        z_sum = np.zeros((h, w), dtype=np.float64)
-        z_cnt = np.zeros((h, w), dtype=np.float64)
-        np.add.at(z_sum, (yi, xi), zv)
-        np.add.at(z_cnt, (yi, xi), 1.0)
-        dem = np.divide(z_sum, z_cnt, out=np.full((h, w), np.nan, dtype=np.float64), where=z_cnt > 0)
+                s_i = self._meta[i].image_width / max(1, sz_i[0])
+                s_j = self._meta[j].image_width / max(1, sz_j[0])
+                p_i_native = p_i * s_i
+                p_j_native = p_j * s_j
 
-        nan_mask = np.isnan(dem)
-        if np.all(nan_mask):
-            print("[DEM] DEM raster empty — skipping DEM")
-            return None, dem_res
+                K_j = self._build_K(self._meta[j], scale=1.0)
+                K_i = self._build_K(self._meta[i], scale=1.0)
 
-        if np.any(nan_mask):
-            idx = distance_transform_edt(nan_mask, return_distances=False, return_indices=True)
-            dem = dem[tuple(idx)]
+                pts3d = triangulate_points(p_j_native.reshape(-1, 2),
+                                            p_i_native.reshape(-1, 2),
+                                            self._poses[j], self._poses[i], K_j)
 
-        dem = cv2.GaussianBlur(dem.astype(np.float32), (5, 5), 0).astype(np.float64)
+                valid = np.isfinite(pts3d).all(axis=1)
+                pts3d = pts3d[valid]
+                p_i_v = p_i_native.reshape(-1, 2)[valid]
 
-        # Normalize to local ground baseline (z≈0 in this pipeline world frame)
-        # and clamp to plausible terrain variation to avoid DEM over-warping.
-        z_med = float(np.median(dem))
-        dem = dem - z_med
-        dem = np.clip(dem, -12.0, 12.0)
+                if len(pts3d) < 20:
+                    continue
+                X_cam = self._poses[i].transform_to_camera(pts3d)
+                in_front = X_cam[:, 2] > 0
+                pts3d = pts3d[in_front]
+                p_i_v = p_i_v[in_front]
+                if len(pts3d) < 15:
+                    continue
 
-        # Strong smoothing to keep only low-frequency terrain shape.
-        dem = cv2.GaussianBlur(dem.astype(np.float32), (0, 0), 4.0).astype(np.float64)
+                dist_arr = np.array(self.dist_coeffs or
+                                    _DEFAULT_DIST.get(self._meta[i].model,
+                                                      _DEFAULT_DIST['UNKNOWN']),
+                                    dtype=np.float64)
+                success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    pts3d.astype(np.float32), p_i_v.astype(np.float32),
+                    K_i.astype(np.float32), dist_arr[:5].astype(np.float32),
+                    iterationsCount=1000, reprojectionError=2.0,
+                    confidence=0.999, flags=cv2.SOLVEPNP_ITERATIVE)
 
-        span = float(np.percentile(dem, 98) - np.percentile(dem, 2))
-        if not np.isfinite(span) or span < 0.2:
-            print("[DEM] DEM not informative after normalization — skipping DEM")
-            return None, dem_res
+                if not success or inliers is None or len(inliers) < 15:
+                    continue
 
-        dem *= self.dem_strength
-        print(f"[DEM] DEM ready: {w}x{h} cells, points={pts.shape[0]}, "
-              f"span={span:.2f}m, strength={self.dem_strength:.2f}")
-        return dem, dem_res
+                R_new, _ = cv2.Rodrigues(rvec)
+                t_new = tvec.flatten()
 
-    def _refine_overlap_shift(self,
-                              ref_img: np.ndarray,
-                              ref_w: np.ndarray,
-                              new_img: np.ndarray,
-                              new_w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        overlap = (ref_w > 1e-6) & (new_w > 0.2)
-        if int(np.count_nonzero(overlap)) < 6000:
-            return new_img, new_w
+                # For nadir flights, PnP rotation is unreliable.
+                # Keep original rotation, only correct position.
+                C_new = -R_new.T @ t_new
+                d_xy = np.linalg.norm(C_new[:2] - self._poses[i].C[:2])
 
-        ys, xs = np.where(overlap)
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        if (y1 - y0) < 64 or (x1 - x0) < 64:
-            return new_img, new_w
+                if d_xy > 15.0 or d_xy < 0.01:
+                    continue
 
-        ref_u8 = cv2.cvtColor(ref_img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        new_u8 = cv2.cvtColor(new_img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        ref_gray = ref_u8.astype(np.float32)
-        new_gray = new_u8.astype(np.float32)
-        m = overlap[y0:y1, x0:x1]
-        if int(np.count_nonzero(m)) < 4000:
-            return new_img, new_w
+                R_orig = self._poses[i].R
+                pose_new = Pose(R=R_orig, t=-R_orig @ C_new)
 
-        # 1) Try robust affine refinement from feature correspondences
-        #    (captures residual yaw/scale drift better than pure translation).
-        orb = cv2.ORB_create(nfeatures=1200, scaleFactor=1.2, nlevels=8)
-        kp_ref, des_ref = orb.detectAndCompute(ref_u8, None)
-        kp_new, des_new = orb.detectAndCompute(new_u8, None)
-        if des_ref is not None and des_new is not None and len(kp_ref) >= 40 and len(kp_new) >= 40:
-            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-            knn = matcher.knnMatch(des_new, des_ref, k=2)
+                best_pose = pose_new
+                best_info = (j, d_xy, len(inliers))
+                break  # prefer skip-2
+
+            if best_pose is not None:
+                self._poses[i] = best_pose
+                j, d_xy, n_in = best_info
+                print(f"  Pose {i} (ref {j}): corrected by "
+                      f"{d_xy:.2f}m ({n_in} inliers)")
+                n_corrected += 1
+
+        print(f"Pairwise refinement done: {n_corrected}/{len(self._poses)} poses corrected")
+
+    # ── DEM via DEMBuilder ────────────────────────────────────
+
+    def _build_dem(self, meta, poses, bounds, gsd):
+        """Build DSM using the new DEMBuilder class."""
+        if not self.use_dem:
+            return None, 1.0
+
+        dem_gsd = self.dem_gsd or max(1.0, gsd * 10)
+        dem_params = DEMParams(
+            dem_gsd=dem_gsd,
+            mode=self.dem_mode,
+            stereo_scale=0.25,
+            min_overlap=0.35,
+            max_pairs_per_image=5,
+            smooth_sigma=2.0)
+
+        image_paths = [m.path for m in meta]
+        cameras = [self._build_camera(m) for m in meta]
+
+        # Ground Z in AGL frame is 0
+        ground_z = 0.0
+
+        # Distortion coefficients per image
+        dist_list = []
+        for m in meta:
+            d = (self.dist_coeffs or
+                 _DEFAULT_DIST.get(m.model, _DEFAULT_DIST['UNKNOWN']))
+            dist_list.append(np.array(d, dtype=np.float64))
+
+        builder = DEMBuilder(dem_params)
+        dsm, dsm_gsd = builder.build(
+            image_paths=image_paths,
+            poses=poses,
+            cameras=cameras,
+            bounds=bounds,
+            pipeline_scale=self.scale,
+            dist_coeffs_list=dist_list,
+            ground_z=ground_z)
+
+        # Apply DEM strength (blend with flat surface)
+        if self.dem_strength < 1.0:
+            dsm = dsm * self.dem_strength
+
+        return dsm, dsm_gsd
+
+    # ── Multiband blending ────────────────────────────────────
+
+    def _multiband_blend(self, ortho_tiles, weight_tiles, out_h, out_w):
+        """Laplacian pyramid multi-band blending for seamless mosaic."""
+        LEVELS = 5
+        nc = 3
+
+        def gauss_pyr(img, n):
+            p = [img.astype(np.float32)]
+            for _ in range(n):
+                p.append(cv2.pyrDown(p[-1]))
+            return p
+
+        def lap_pyr(img, n):
+            g = gauss_pyr(img, n)
+            lp = []
+            for i in range(n):
+                up = cv2.pyrUp(g[i+1], dstsize=(g[i].shape[1], g[i].shape[0]))
+                lp.append(g[i].astype(np.float64) - up.astype(np.float64))
+            lp.append(g[-1].astype(np.float64))
+            return lp
+
+        result_pyrs = [np.zeros_like(lvl, dtype=np.float64)
+                       for lvl in lap_pyr(
+                           np.zeros((out_h, out_w, nc), dtype=np.float32), LEVELS)]
+        weight_acc  = [np.zeros((lvl.shape[0], lvl.shape[1]), dtype=np.float64)
+                       for lvl in result_pyrs]
+
+        for tile, wgt in zip(ortho_tiles, weight_tiles):
+            th, tw = tile.shape[:2]
+            full_tile = np.zeros((out_h, out_w, nc), dtype=np.float32)
+            full_tile[:th, :tw] = tile.astype(np.float32)
+            full_w = np.zeros((out_h, out_w), dtype=np.float32)
+            full_w[:th, :tw] = wgt.astype(np.float32)
+
+            lp = lap_pyr(full_tile, LEVELS)
+            gm = gauss_pyr(full_w, LEVELS)
+
+            for lvl_idx in range(len(lp)):
+                g = gm[lvl_idx]
+                if g.ndim == 2:
+                    g = g[:,:,np.newaxis]
+                result_pyrs[lvl_idx] += lp[lvl_idx] * g
+                weight_acc[lvl_idx]  += gm[lvl_idx]
+
+            del full_tile, full_w, lp, gm; gc.collect()
+
+        for lvl_idx in range(len(result_pyrs)):
+            w = weight_acc[lvl_idx]
+            w3 = np.maximum(w[:,:,np.newaxis] if w.ndim == 2 else w, 1e-8)
+            result_pyrs[lvl_idx] /= w3
+
+        result = result_pyrs[-1]
+        for lvl in reversed(result_pyrs[:-1]):
+            result = cv2.pyrUp(result, dstsize=(lvl.shape[1], lvl.shape[0]))
+            result = result.astype(np.float64) + lvl.astype(np.float64)
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    # ── Overlap refinement ────────────────────────────────────
+
+    def _refine_overlap(self, meta, poses, ort):
+        """Affine (ORB+RANSAC) + phase-correlation XY shift refinement."""
+        if not self.refine_overlap_shift or len(poses) < 2:
+            return
+        print("\nOverlap XY refinement …")
+        SCALE_REF = 0.15
+
+        feats = []
+        for m in meta:
+            img = cv2.imread(str(m.path))
+            if img is None:
+                feats.append(None)
+                continue
+            nw = max(64, int(m.image_width * SCALE_REF))
+            nh = max(64, int(m.image_height * SCALE_REF))
+            img_s = cv2.resize(img, (nw, nh))
+            gray = cv2.cvtColor(img_s, cv2.COLOR_BGR2GRAY)
+            orb = cv2.ORB_create(nfeatures=800)
+            kp, des = orb.detectAndCompute(gray, None)
+            feats.append((kp, des, img_s.shape[:2]))
+            del img; gc.collect()
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        for i in range(len(poses) - 1):
+            if feats[i] is None or feats[i+1] is None:
+                continue
+            kp1, d1, sz1 = feats[i]
+            kp2, d2, sz2 = feats[i+1]
+            if d1 is None or d2 is None:
+                continue
+            matches = bf.knnMatch(d1, d2, k=2)
             good = []
-            for pair in knn:
+            for pair in matches:
                 if len(pair) < 2:
                     continue
-                a, b = pair
-                if a.distance < 0.78 * b.distance:
-                    good.append(a)
+                m, n = pair
+                if m.distance < 0.75 * n.distance:
+                    good.append(m)
+            if len(good) < 10:
+                continue
 
-            if len(good) >= 30:
-                src = np.float32([kp_new[g.queryIdx].pt for g in good]).reshape(-1, 1, 2)
-                dst = np.float32([kp_ref[g.trainIdx].pt for g in good]).reshape(-1, 1, 2)
-                M_loc, inlier_mask = cv2.estimateAffinePartial2D(
-                    src, dst,
-                    method=cv2.RANSAC,
-                    ransacReprojThreshold=2.5,
-                    maxIters=3000,
-                    confidence=0.995,
-                    refineIters=20,
-                )
-                if M_loc is not None and inlier_mask is not None:
-                    inliers = int(inlier_mask.sum())
-                    a, b, tx = M_loc[0]
-                    c, d, ty = M_loc[1]
-                    scale = float(np.sqrt(max(a * a + c * c, 1e-12)))
-                    rot_deg = float(np.degrees(np.arctan2(c, a)))
-                    if (inliers >= 25 and
-                        0.97 <= scale <= 1.03 and
-                        abs(rot_deg) <= 6.0 and
-                        abs(tx) <= self.max_shift_px and
-                        abs(ty) <= self.max_shift_px):
-                        # Lift local-crop transform to full tile coordinates.
-                        T1 = np.array([[1., 0., -x0], [0., 1., -y0], [0., 0., 1.]], dtype=np.float32)
-                        A3 = np.array([[a, b, tx], [c, d, ty], [0., 0., 1.]], dtype=np.float32)
-                        T2 = np.array([[1., 0., x0], [0., 1., y0], [0., 0., 1.]], dtype=np.float32)
-                        M_full = (T2 @ A3 @ T1)[:2, :]
-                        shifted_img = cv2.warpAffine(
-                            new_img, M_full, (new_img.shape[1], new_img.shape[0]),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=0,
-                        )
-                        shifted_w = cv2.warpAffine(
-                            new_w.astype(np.float32), M_full, (new_w.shape[1], new_w.shape[0]),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=0,
-                        ).astype(np.float64)
-                        return shifted_img, shifted_w
+            p1 = np.float32([kp1[g.queryIdx].pt for g in good])
+            p2 = np.float32([kp2[g.trainIdx].pt for g in good])
 
-        # 2) Fallback: translation-only phase correlation.
-        ref_f = np.zeros_like(ref_gray, dtype=np.float32)
-        new_f = np.zeros_like(new_gray, dtype=np.float32)
-        ref_vals = ref_gray[m]
-        new_vals = new_gray[m]
-        ref_f[m] = ref_vals - float(ref_vals.mean())
-        new_f[m] = new_vals - float(new_vals.mean())
+            # Scale to ortho pixel coords
+            s1 = self._meta[i].image_width / max(1, sz1[1])
+            s2 = self._meta[i+1].image_width / max(1, sz2[1])
+            p1_o = p1 * s1 * self.scale
+            p2_o = p2 * s2 * self.scale
 
-        h, w = ref_f.shape
-        win = cv2.createHanningWindow((w, h), cv2.CV_32F)
-        (dx, dy), response = cv2.phaseCorrelate(ref_f, new_f, win)
-        if response < 0.05:
-            return new_img, new_w
-        if abs(dx) > self.max_shift_px or abs(dy) > self.max_shift_px:
-            return new_img, new_w
+            # Compute XY shift in world coords
+            M, inliers = cv2.estimateAffinePartial2D(p2_o, p1_o)
+            if M is None:
+                continue
+            dx_px = M[0, 2]
+            dy_px = M[1, 2]
+            shift_m = np.sqrt(dx_px**2 + dy_px**2) * ort.gsd
 
-        M = np.array([[1.0, 0.0, dx],
-                      [0.0, 1.0, dy]], dtype=np.float32)
-        shifted_img = cv2.warpAffine(
-            new_img, M, (new_img.shape[1], new_img.shape[0]),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        shifted_w = cv2.warpAffine(
-            new_w.astype(np.float32), M, (new_w.shape[1], new_w.shape[0]),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float64)
-        return shifted_img, shifted_w
+            if shift_m < 0.01 or shift_m > self.max_shift_px * ort.gsd:
+                continue
+
+            # Apply shift to pose i+1
+            dx_world = dx_px * ort.gsd
+            dy_world = dy_px * ort.gsd
+            C = poses[i+1].C.copy()
+            C[0] += dx_world
+            C[1] -= dy_world  # north-at-top: +row = -northing
+            poses[i+1].C = C
+
+    # ── Gap-fill images ───────────────────────────────────────
+
+    def _get_fill_images(self):
+        """Return ALL valid images (including thinned-out ones) with poses
+        for full-coverage compositing."""
+        if not self._utm or not self._all_meta_valid:
+            return [], []
+        all_meta = []
+        all_poses = []
+        main_paths = {m.path for m in self._meta}
+
+        for m in self._all_meta_valid:
+            if m.path in main_paths:
+                idx = next(i for i, mm in enumerate(self._meta) if mm.path == m.path)
+                all_meta.append(m)
+                all_poses.append(self._poses[idx])
+            else:
+                e, n = self._utm.latlon_to_utm(m.latitude, m.longitude)
+                if m.altitude_rel > 0:
+                    agl = m.altitude_rel
+                else:
+                    agl = m.altitude_abs - self.ground_alt
+                if agl <= 0:
+                    continue
+                gc_deg = self._utm.compute_grid_convergence(m.latitude, m.longitude)
+                yaw_abs = m.gimbal_yaw if abs(m.gimbal_yaw) > 0.5 else m.flight_yaw
+                yaw_corrected = yaw_abs + gc_deg
+                pose = Pose.from_dji_gimbal(
+                    yaw_corrected, m.gimbal_pitch, m.gimbal_roll,
+                    np.array([e, n, agl]))
+                all_meta.append(m)
+                all_poses.append(pose)
+        return all_meta, all_poses

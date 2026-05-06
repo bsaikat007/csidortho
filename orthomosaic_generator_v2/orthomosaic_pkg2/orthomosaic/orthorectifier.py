@@ -81,8 +81,9 @@ class Orthorectifier:
         """
         img_h, img_w = image.shape[:2]
 
+        # Row 0 = y_max (north-at-top) — matches GeoTIFF from_origin convention
         x_out = np.arange(self.width)  * self.gsd + self.x_min
-        y_out = np.arange(self.height) * self.gsd + self.y_min
+        y_out = self.y_max - np.arange(self.height) * self.gsd
         xx, yy = np.meshgrid(x_out, y_out)
         xf, yf = xx.ravel(), yy.ravel()
         zf = self._elevation(xf, yf)
@@ -186,7 +187,7 @@ class Orthorectifier:
         min_d   = np.full((self.height, self.width), np.inf)
         for i, pose in enumerate(poses):
             cx = (pose.C[0] - self.x_min) / self.gsd
-            cy = (pose.C[1] - self.y_min) / self.gsd
+            cy = (self.y_max - pose.C[1]) / self.gsd   # north-at-top
             d  = (xx - cx)**2 + (yy - cy)**2
             upd = d < min_d
             lmap[upd] = i; min_d[upd] = d[upd]

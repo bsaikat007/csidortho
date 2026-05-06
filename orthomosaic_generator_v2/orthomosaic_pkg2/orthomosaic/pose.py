@@ -80,36 +80,51 @@ class Pose:
         return cls(R=R_world2cam, t=-R_world2cam @ pos)
 
     @classmethod
+    def from_dji_gimbal(cls, yaw_deg: float, pitch_deg: float, roll_deg: float,
+                        position: np.ndarray) -> 'Pose':
+        """
+        Build pose from DJI gimbal angles (world-referenced absolute angles).
+
+        DJI convention:
+          yaw:   0°=North, 90°=East, clockwise positive (true bearing)
+          pitch: -90°=nadir (straight down), 0°=horizontal forward
+          roll:  0°=level, positive=right-side-down
+
+        Derivation: start from nadir (alpha=0), rotate around cam_x (starboard)
+        by alpha = 90°+pitch toward horizontal-forward.
+
+          cam_x = [cos θ, −sin θ,  0]           starboard (constant for all pitch)
+          cam_y = [−sin θ·cos α, −cos θ·cos α, −sin α]  image-down
+          cam_z = [ sin α·sin θ,  sin α·cos θ, −cos α]  optical axis (into scene)
+
+        Verified:
+          pitch=-90° (α=0)  → cam_z=[0,0,−1] (nadir)      ✓
+          pitch=0°   (α=90°) → cam_z=[sin θ, cos θ, 0] (horiz forward) ✓
+        """
+        th    = np.radians(yaw_deg)
+        alpha = np.radians(90.0 + pitch_deg)   # 0 = nadir, π/2 = horizontal
+        phi   = np.radians(roll_deg)
+
+        cam_x = np.array([ np.cos(th),                        -np.sin(th),              0.])
+        cam_y = np.array([-np.sin(th) * np.cos(alpha), -np.cos(th) * np.cos(alpha), -np.sin(alpha)])
+        cam_z = np.array([ np.sin(alpha) * np.sin(th),  np.sin(alpha) * np.cos(th), -np.cos(alpha)])
+
+        if abs(phi) > 1e-6:
+            # Roll: rotate cam_x/cam_y around optical axis
+            cx =  np.cos(phi) * cam_x + np.sin(phi) * cam_y
+            cy = -np.sin(phi) * cam_x + np.cos(phi) * cam_y
+            cam_x, cam_y = cx, cy
+
+        R = np.array([cam_x, cam_y, cam_z], dtype=np.float64)
+        C = np.asarray(position, dtype=np.float64)
+        return cls(R=R, t=-R @ C)
+
+    @classmethod
     def make_nadir(cls, easting: float, northing: float, agl: float,
                    yaw_deg: float) -> 'Pose':
-        """
-        Build a nadir (straight-down) camera pose.
-
-        Tested on DJI FC6310 — this is the correct constructor for
-        GimbalPitch = -90° (pure nadir) flights.
-
-        World frame: ENU (East=+X, North=+Y, Up=+Z)
-        Camera frame: (right, down-row, forward=optical-axis)
-
-        For nadir: optical axis points -Z (down in world).
-        Camera right-axis = East when yaw_deg = 90° (East).
-        DJI yaw convention: 0°=North, 90°=East, clockwise positive.
-
-        Args:
-            easting, northing: UTM position (metres)
-            agl:               altitude above ground level (metres)
-            yaw_deg:           DJI gimbal yaw (degrees, 0=N, CW)
-        """
-        th     = np.radians(yaw_deg)
-        cam_z  = np.array([0., 0., -1.])            # optical axis → down
-        # Camera right (X) is perpendicular to yaw: yaw=0°(N) → right=E, yaw=90°(E) → right=S
-        cam_x  = np.array([np.cos(th), -np.sin(th), 0.])
-        cam_y  = np.cross(cam_z, cam_x)             # complete right-hand frame
-
-        # R_world2cam rows = cam axes expressed in world
-        R = np.array([cam_x, cam_y, cam_z], dtype=np.float64)
-        C = np.array([easting, northing, agl], dtype=np.float64)
-        return cls(R=R, t=-R @ C)
+        """Nadir convenience wrapper — delegates to from_dji_gimbal."""
+        return cls.from_dji_gimbal(yaw_deg, -90.0, 0.0,
+                                   np.array([easting, northing, agl]))
 
     @classmethod
     def from_quaternion(cls, q: np.ndarray, position: np.ndarray) -> 'Pose':

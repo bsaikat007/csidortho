@@ -44,12 +44,20 @@ RAM guide:
     p.add_argument('--blending',   choices=['weighted','nearest','multiband'],
                    default='weighted')
     p.add_argument('--bundle-adjust', action='store_true')
+    p.add_argument('--min-baseline', type=float, default=2.0,
+                   help='Min baseline (m) for frame thinning (0=off)')
+    p.add_argument('--agl-tolerance', type=float, default=15.0,
+                   help='Max AGL deviation from median (0=off)')
+    p.add_argument('--no-overlap-refine', action='store_true',
+                   help='Disable overlap XY shift refinement')
     p.add_argument('--use-dem', action='store_true',
-                   help='Build and use internal DEM for terrain-aware orthorectification')
-    p.add_argument('--dem-resolution', type=float, default=None,
-                   help='DEM grid resolution in metres (default: auto from GSD)')
+                   help='Build DEM for terrain-aware orthorectification')
+    p.add_argument('--dem-mode', choices=['sparse','dense','both'],
+                   default='sparse', help='DEM point cloud mode')
+    p.add_argument('--dem-gsd', type=float, default=None,
+                   help='DEM resolution m/px (default: auto)')
     p.add_argument('--dem-strength', type=float, default=0.25,
-                   help='DEM influence 0..1 (default: 0.25, conservative)')
+                   help='DEM strength 0-1 (0=flat, 1=full terrain)')
     args = p.parse_args()
 
     if not args.images.exists():
@@ -62,11 +70,6 @@ RAM guide:
     if args.gsd:
         print(f"GSD       : {args.gsd} m/px")
     print(f"Scale     : {args.scale}")
-    if args.use_dem:
-        print(f"Use DEM   : yes")
-        if args.dem_resolution:
-            print(f"DEM res   : {args.dem_resolution} m")
-        print(f"DEM str   : {args.dem_strength}")
 
     try:
         from orthomosaic import OrthoPipeline
@@ -82,9 +85,13 @@ RAM guide:
         ground_alt  = args.ground_alt,
         run_ba      = args.bundle_adjust,
         blending    = args.blending,
-        use_dem     = args.use_dem,
-        dem_resolution = args.dem_resolution,
-        dem_strength = args.dem_strength,
+        min_baseline_m      = args.min_baseline,
+        agl_tolerance_m    = args.agl_tolerance,
+        refine_overlap_shift = not args.no_overlap_refine,
+        use_dem            = args.use_dem,
+        dem_mode           = args.dem_mode,
+        dem_gsd            = args.dem_gsd,
+        dem_strength       = args.dem_strength,
     )
     try:
         out = pipe.run()
