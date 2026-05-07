@@ -388,19 +388,34 @@ class OrthoPipeline:
 
             cam  = self._build_camera(m)
 
-            # Color harmonization
-            img_f = img.astype(np.float64)
+            # Pre-undistort the image if supported
+            if hasattr(cam, 'undistort_image'):
+                undist_img = cam.undistort_image(img)
+                pin_cam = PinholeCamera(
+                    width=undist_img.shape[1],
+                    height=undist_img.shape[0],
+                    fx=cam.fx, fy=cam.fy,
+                    cx=cam.cx, cy=cam.cy,
+                    skew=cam.skew
+                )
+                img_use = undist_img
+            else:
+                img_use = img
+                pin_cam = cam
+
+            # Color harmonization on img_use
+            img_f = img_use.astype(np.float64)
             for c in range(3):
-                tile_mean = float(img_f[:,:,c][img_f[:,:,c] > 0].mean()) \
-                    if np.any(img_f[:,:,c] > 0) else 128.
-                tile_std  = float(np.std(img_f[:,:,c][img_f[:,:,c] > 0])) \
-                    if np.any(img_f[:,:,c] > 0) else 40.
-                if tile_std < 1.0: tile_std = 40.0
+                mask_c = img_f[:,:,c] > 0
+                tile_mean = float(img_f[:,:,c][mask_c].mean()) if np.any(mask_c) else 128.
+                tile_std  = float(np.std(img_f[:,:,c][mask_c])) if np.any(mask_c) else 40.
+                if tile_std < 1.0:
+                    tile_std = 40.0
                 img_f[:,:,c] = (img_f[:,:,c] - tile_mean) * (ref_std[c] / tile_std) + ref_mean[c]
-            img = np.clip(img_f, 0, 255).astype(np.uint8)
+            img_use = np.clip(img_f, 0, 255).astype(np.uint8)
             del img_f
 
-            ortho, weight = ort.orthorectify_image(img, pose, cam)
+            ortho, weight = ort.orthorectify_image(img_use, pose, pin_cam)
             oh = min(ortho.shape[0], out_h)
             ow = min(ortho.shape[1], out_w)
 
@@ -435,19 +450,34 @@ class OrthoPipeline:
                         img = cv2.resize(img, (nw, nh))
 
                     cam = self._build_camera(m)
-                    # Color harmonization
-                    img_f = img.astype(np.float64)
+                    # Pre-undistort and use pinhole camera
+                    if hasattr(cam, 'undistort_image'):
+                        undist_img = cam.undistort_image(img)
+                        pin_cam = PinholeCamera(
+                            width=undist_img.shape[1],
+                            height=undist_img.shape[0],
+                            fx=cam.fx, fy=cam.fy,
+                            cx=cam.cx, cy=cam.cy,
+                            skew=cam.skew
+                        )
+                        img_use = undist_img
+                    else:
+                        img_use = img
+                        pin_cam = cam
+
+                    # Color harmonization on img_use
+                    img_f = img_use.astype(np.float64)
                     for c in range(3):
-                        tile_mean = float(img_f[:,:,c][img_f[:,:,c] > 0].mean()) \
-                            if np.any(img_f[:,:,c] > 0) else 128.
-                        tile_std = float(np.std(img_f[:,:,c][img_f[:,:,c] > 0])) \
-                            if np.any(img_f[:,:,c] > 0) else 40.
-                        if tile_std < 1.0: tile_std = 40.0
+                        mask_c = img_f[:,:,c] > 0
+                        tile_mean = float(img_f[:,:,c][mask_c].mean()) if np.any(mask_c) else 128.
+                        tile_std  = float(np.std(img_f[:,:,c][mask_c])) if np.any(mask_c) else 40.
+                        if tile_std < 1.0:
+                            tile_std = 40.0
                         img_f[:,:,c] = (img_f[:,:,c] - tile_mean) * (ref_std[c] / tile_std) + ref_mean[c]
-                    img = np.clip(img_f, 0, 255).astype(np.uint8)
+                    img_use = np.clip(img_f, 0, 255).astype(np.uint8)
                     del img_f
 
-                    ortho, weight = ort.orthorectify_image(img, pose, cam)
+                    ortho, weight = ort.orthorectify_image(img_use, pose, pin_cam)
                     oh = min(ortho.shape[0], out_h)
                     ow = min(ortho.shape[1], out_w)
 
